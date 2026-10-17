@@ -81,7 +81,11 @@ fields (`lease_lost` or `database_error`) for metric wiring; job IDs and origina
 errors stay in warnings. Metrics are process observations, not a persisted audit;
 a crash after SQL commits and before callback delivery may undercount. `maxJobs`
 counts confirmed terminal transitions. A stop signal drains the current attempt;
-it is separate from the attempt's cancellation signal. One active job is enforced
+it is separate from the attempt's cancellation signal. After an in-flight claim, stop is rechecked before decode/handle. Only an
+unstarted claim is released through the fenced retry statement with zero delay.
+Its fencing generation is never refunded, so repeated pre-start shutdowns can
+exhaust the claim budget without handler execution. An advanced generation makes
+release a no-op. One active job is enforced
 per `runJobs` loop, not per worker process. Use separate ordinary worker
 Deployments for materially different resource/reliability classes.
 

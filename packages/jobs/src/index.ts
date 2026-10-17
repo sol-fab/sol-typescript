@@ -476,6 +476,14 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
       continue;
     }
 
+    if (stopped()) {
+      if (await transition(row, "retry", RETRY_SQL,
+        [0, "worker stopped before starting handler", row.id, row.attempts, contract.workspace])) {
+        options.onOutcome?.({ kind: row.kind, status: "retry", durationS: 0 });
+      }
+      continue;
+    }
+
     const outcome = await runHandler(row);
     if ("lost" in outcome) continue;
     const durationS = outcome.durationS;
