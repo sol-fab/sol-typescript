@@ -411,3 +411,16 @@ withDb("joining renewal accepts sleep cancellation that rejects on abort", async
     assert.equal((await rows(pool))[0]?.status, "completed");
   });
 });
+
+withDb("a durable outcome observer error is not reported as a database error", async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    const errors: string[] = [];
+    await assert.rejects(runJobs({ pool, contract, maxJobs: 1,
+      onOutcome: () => { throw new Error("observer failed"); },
+      onQueueError: e => errors.push(e.reason)
+    }), /observer failed/);
+    assert.deepEqual(errors, []);
+    assert.equal((await rows(pool))[0]?.status, "completed");
+  });
+});

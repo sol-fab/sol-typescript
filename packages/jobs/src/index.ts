@@ -356,6 +356,21 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
       "sol-jobs: queue operation failed (the lease may expire and the job may run again)");
   };
 
+  const transition = async (row: ClaimedRow, action: QueueError["action"], sql: string, values: unknown[]): Promise<boolean> => {
+    let result;
+    try {
+      result = await pool.query(sql, values);
+    } catch (error) {
+      databaseError(row, action, error);
+      return false;
+    }
+    if (result.rowCount === 0) {
+      leaseLost(row, action);
+      return false;
+    }
+    return true;
+  };
+
   const recordTerminal = (outcome: JobOutcome): void => {
     if (remaining !== undefined) remaining -= 1;
     options.onOutcome?.(outcome);
@@ -377,16 +392,18 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
           throw error;
         }
         if (!renewing) return;
+        let result;
         try {
-          const result = await pool.query(RENEW_SQL, [leaseS, row.id, row.attempts, contract.workspace]);
-          if (result.rowCount === 0) {
-            lost = true;
-            leaseLost(row, "renew");
-            execution.abort(new Error("sol-jobs: confirmed claim loss"));
-            return;
-          }
+          result = await pool.query(RENEW_SQL, [leaseS, row.id, row.attempts, contract.workspace]);
         } catch (error) {
           databaseError(row, "renew", error);
+          continue;
+        }
+        if (result.rowCount === 0) {
+          lost = true;
+          execution.abort(new Error("sol-jobs: confirmed claim loss"));
+          leaseLost(row, "renew");
+          return;
         }
       }
     })();
@@ -463,50 +480,23 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
     if ("lost" in outcome) continue;
     const durationS = outcome.durationS;
     if (outcome.ok) {
-      try {
-        const result = (await pool.query(COMPLETE_SQL, [
-          row.id,
-          row.attempts,
-          contract.workspace,
-        ])) as { rowCount: number | null };
-        if (result.rowCount === 0) leaseLost(row, "complete");
-        else recordTerminal({ kind: row.kind, status: "ok", durationS });
-      } catch (error) {
-        databaseError(row, "complete", error);
+      if (await transition(row, "complete", COMPLETE_SQL, [row.id, row.attempts, contract.workspace])) {
+        recordTerminal({ kind: row.kind, status: "ok", durationS });
       }
       continue;
     }
 
     const exhausted = policy.maxAttempts >= 0 && row.attempts >= policy.maxAttempts;
     if (exhausted) {
-      try {
-        const result = (await pool.query(FAIL_SQL, [
-          outcome.message,
-          row.id,
-          row.attempts,
-          contract.workspace,
-        ])) as { rowCount: number | null };
-        if (result.rowCount === 0) leaseLost(row, "fail");
-        else recordTerminal({ kind: row.kind, status: "failed", durationS });
-      } catch (error) {
-        databaseError(row, "fail", error);
+      if (await transition(row, "fail", FAIL_SQL, [outcome.message, row.id, row.attempts, contract.workspace])) {
+        recordTerminal({ kind: row.kind, status: "failed", durationS });
       }
       continue;
     }
 
     const delay = backoffS(policy, row.attempts, rng);
-    try {
-      const result = (await pool.query(RETRY_SQL, [
-        delay,
-        outcome.message,
-        row.id,
-        row.attempts,
-        contract.workspace,
-      ])) as { rowCount: number | null };
-      if (result.rowCount === 0) leaseLost(row, "retry");
-      else options.onOutcome?.({ kind: row.kind, status: "retry", durationS });
-    } catch (error) {
-      databaseError(row, "retry", error);
+    if (await transition(row, "retry", RETRY_SQL, [delay, outcome.message, row.id, row.attempts, contract.workspace])) {
+      options.onOutcome?.({ kind: row.kind, status: "retry", durationS });
     }
   }
 
