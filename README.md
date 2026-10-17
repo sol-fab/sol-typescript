@@ -59,6 +59,32 @@ WebCrypto, so the package keeps no runtime dependencies.
 topic. Kafka says "this happened"; the job table says "this must happen", and
 `enqueue` accepts a `PoolClient` so it can join the transaction that caused it.
 
+Jobs are at-least-once: duplicate handlers can overlap after lease expiry or an
+external effect followed by a crash. Enqueue dedupe keys suppress insertion only
+while their row is retained; put a stable business operation ID in the payload
+and use the provider's idempotency key for external effects. Sweep retention is
+scoped to the runner's workspace and kinds. Consumers sharing a kind must agree
+on codecs and retry/retention policies; no central registry enforces that.
+
+A confirmed claim loss aborts the handler's `context.signal`. Handlers should
+pass that signal to cancellable dependencies and join all their work before
+returning. The runner waits for cleanup and never finalizes that lost attempt,
+even if the handler returns success after abort. Query errors mean uncertain
+ownership and are logged/retried; they do not abort execution. Cancellation is
+cooperative and cannot stop blocking JavaScript or retract an accepted external
+request. An expired but unreclaimed attempt may renew using its attempt fence.
+
+`onOutcome` reports only confirmed durable transitions (`ok`, `retry`, `failed`),
+while `onHandlerOutcome` reports handler returns and monotonic execution duration
+before finalization. `onQueueError` carries bounded `kind`, `action` and `reason`
+fields (`lease_lost` or `database_error`) for metric wiring; job IDs and original
+errors stay in warnings. Metrics are process observations, not a persisted audit;
+a crash after SQL commits and before callback delivery may undercount. `maxJobs`
+counts confirmed terminal transitions. A stop signal drains the current attempt;
+it is separate from the attempt's cancellation signal. One active job is enforced
+per `runJobs` loop, not per worker process. Use separate ordinary worker
+Deployments for materially different resource/reliability classes.
+
 No `@sol-fab/fn` package exists yet -- `sol-fn`'s OCaml contract (run once,
 return, `SIGTERM` before the next invocation) has no measured TypeScript gap
 to justify one; see the `sol` repo's `FEAT-036` ticket.

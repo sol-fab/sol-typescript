@@ -3,7 +3,7 @@
  * (framework/ocaml/sol-jobs) in capability and observable behaviour rather than
  * implementation (DEC-022):
  *
- *   - `enqueue` is a plain `INSERT`, so calling it with a pool handle from
+ *   - `enqueue` is a plain `INSERT`, so calling it with a PoolClient from
  *     inside a transaction puts the job in the *same* Postgres transaction as
  *     the state change that caused it -- no dual-write hole, and no second
  *     broker. That is the one thing Kafka structurally cannot give you.
@@ -39,6 +39,8 @@ export const JOBS_TABLE = "sol_jobs";
 
 /** The metric names `sol-jobs` emits, for a cross-language dashboard. */
 export const SOL_JOBS_PROCESSED_TOTAL = "sol_jobs_processed_total";
+export const SOL_JOBS_HANDLER_OUTCOMES_TOTAL = "sol_jobs_handler_outcomes_total";
+export const SOL_JOBS_QUEUE_ERRORS_TOTAL = "sol_jobs_queue_errors_total";
 export const SOL_JOBS_JOB_DURATION_SECONDS = "sol_jobs_job_duration_seconds";
 
 export type RunError =
@@ -59,6 +61,11 @@ export interface Queryable {
   query(text: string, values?: unknown[]): Promise<unknown>;
 }
 
+export interface JobContext {
+  /** Cooperative cancellation after confirmed claim loss. Join all attempt work before returning. */
+  readonly signal: AbortSignal;
+}
+
 export interface JobContract<T> {
   /** The workspace whose rows this queue owns; rows of other workspaces are never claimed. */
   readonly workspace: string;
@@ -69,7 +76,7 @@ export interface JobContract<T> {
   /** Throw to reject a payload; the job is retried or failed, never silently dropped. */
   readonly decode: (payload: string) => T;
   /** Resolve for success; throw to fail the attempt. */
-  readonly handle: (job: T) => Promise<void>;
+  readonly handle: (job: T, context: JobContext) => Promise<void>;
 }
 
 export interface EnqueueOptions {
@@ -151,6 +158,8 @@ export async function enqueue<T>(
   if (!contract.kinds.includes(kind)) {
     throw new Error(`sol-jobs: kind ${JSON.stringify(kind)} is not in kinds; nothing would claim it`);
   }
+  const kindsError = validateKinds(contract.kinds);
+  if (kindsError) throw new Error(`sol-jobs: ${kindsError.message}`);
   const workspaceError = validateWorkspace(contract.workspace);
   if (workspaceError) throw new Error(`sol-jobs: ${workspaceError.message}`);
 
@@ -166,6 +175,18 @@ export interface JobOutcome {
   readonly kind: string;
   readonly status: "ok" | "retry" | "failed";
   readonly durationS: number;
+}
+
+export interface HandlerOutcome {
+  readonly kind: string;
+  readonly status: "ok" | "error";
+  readonly durationS: number;
+}
+
+export interface QueueError {
+  readonly kind: string;
+  readonly action: "renew" | "complete" | "retry" | "fail";
+  readonly reason: "lease_lost" | "database_error";
 }
 
 export interface RunJobsOptions<T> {
@@ -185,6 +206,9 @@ export interface RunJobsOptions<T> {
   readonly signal?: AbortSignal;
   /** `sol_jobs_processed_total{status,kind}` and the duration histogram, if the app wires them. */
   readonly onOutcome?: (outcome: JobOutcome) => void;
+  /** Handler return before finalization; distinct from a confirmed durable transition. */
+  readonly onHandlerOutcome?: (outcome: HandlerOutcome) => void;
+  readonly onQueueError?: (error: QueueError) => void;
   /** Lease-lost and query-failure warnings; defaults to `console.warn`. */
   readonly onWarning?: (fields: Readonly<Record<string, string>>, message: string) => void;
   readonly sleep?: (seconds: number, signal?: AbortSignal) => Promise<void>;
@@ -243,12 +267,12 @@ const FAIL_SQL = `UPDATE ${JOBS_TABLE}
 
 const RENEW_SQL = `UPDATE ${JOBS_TABLE}
   SET locked_until = now() + ($1::float8 * interval '1 second')
-  WHERE id = $2 AND attempts = $3 AND workspace = $4 AND status = 'pending' AND locked_until > now()
+  WHERE id = $2 AND attempts = $3 AND workspace = $4 AND status = 'pending'
   RETURNING id`;
 
 const SWEEP_SQL = `DELETE FROM ${JOBS_TABLE}
-  WHERE status <> 'pending' AND workspace = $1 AND finished_at IS NOT NULL
-    AND finished_at < now() - ($2::float8 * interval '1 second')`;
+  WHERE status <> 'pending' AND workspace = $1 AND kind = ANY(string_to_array($2, ','))
+    AND finished_at IS NOT NULL AND finished_at < now() - ($3::float8 * interval '1 second')`;
 
 const defaultSleep = (seconds: number, signal?: AbortSignal): Promise<void> =>
   new Promise((resolve) => {
@@ -318,65 +342,80 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
   let remaining = options.maxJobs;
   let lastSweep = 0;
 
-  const leaseLost = (id: number, attempts: number, action: string): void =>
+  const leaseLost = (row: ClaimedRow, action: QueueError["action"]): void => {
+    options.onQueueError?.({ kind: row.kind, action, reason: "lease_lost" });
     warn(
-      { job_id: String(id), attempt: String(attempts), action },
+      { job_id: String(row.id), kind: row.kind, attempt: String(row.attempts), action },
       "sol-jobs: lease lost -- the job was re-claimed while this handler ran; this outcome was not " +
         "recorded and the job may have run concurrently",
     );
+  };
+  const databaseError = (row: ClaimedRow, action: QueueError["action"], error: unknown): void => {
+    options.onQueueError?.({ kind: row.kind, action, reason: "database_error" });
+    warn({ job_id: String(row.id), kind: row.kind, attempt: String(row.attempts), action, error: String(error) },
+      "sol-jobs: queue operation failed (the lease may expire and the job may run again)");
+  };
 
   const recordTerminal = (outcome: JobOutcome): void => {
     if (remaining !== undefined) remaining -= 1;
     options.onOutcome?.(outcome);
   };
 
-  const runHandler = async (row: ClaimedRow): Promise<{ ok: true } | { ok: false; message: string }> => {
+  const runHandler = async (row: ClaimedRow): Promise<
+    { ok: true; durationS: number } | { ok: false; message: string; durationS: number } | { lost: true }
+  > => {
     let renewing = true;
+    let lost = false;
+    const execution = new AbortController();
     const renewalStop = new AbortController();
     const renewal = (async () => {
       while (renewing) {
-        await sleep(leaseS / 3, renewalStop.signal);
+        try {
+          await sleep(leaseS / 3, renewalStop.signal);
+        } catch (error) {
+          if (renewalStop.signal.aborted) return;
+          throw error;
+        }
         if (!renewing) return;
         try {
-          const result = (await pool.query(RENEW_SQL, [leaseS, row.id, row.attempts, contract.workspace])) as {
-            rowCount: number | null;
-          };
+          const result = await pool.query(RENEW_SQL, [leaseS, row.id, row.attempts, contract.workspace]);
           if (result.rowCount === 0) {
-            leaseLost(row.id, row.attempts, "renew");
+            lost = true;
+            leaseLost(row, "renew");
+            execution.abort(new Error("sol-jobs: confirmed claim loss"));
             return;
           }
         } catch (error) {
-          warn(
-            { job_id: String(row.id), error: String(error) },
-            "sol-jobs: lease renewal failed",
-          );
+          databaseError(row, "renew", error);
         }
       }
     })();
+    const started = performance.now();
+    let outcome: { ok: true; durationS: number } | { ok: false; message: string; durationS: number };
     try {
-      let job: T;
+      let result: { ok: true } | { ok: false; message: string };
       try {
-        job = contract.decode(row.payload);
+        await contract.handle(contract.decode(row.payload), { signal: execution.signal });
+        result = { ok: true };
       } catch (error) {
-        return { ok: false, message: error instanceof Error ? error.message : String(error) };
+        result = { ok: false, message: error instanceof Error ? error.message : String(error) };
       }
-      try {
-        await contract.handle(job);
-        return { ok: true };
-      } catch (error) {
-        return { ok: false, message: error instanceof Error ? error.message : String(error) };
-      }
+      const durationS = (performance.now() - started) / 1000;
+      if (!execution.signal.aborted) options.onHandlerOutcome?.({ kind: row.kind, status: result.ok ? "ok" : "error", durationS });
+      outcome = { ...result, durationS };
     } finally {
       renewing = false;
       renewalStop.abort();
-      void renewal.catch(() => {});
+      // Join any in-flight renewal before deciding whether finalization is allowed.
+      await renewal;
     }
+    return lost ? { lost: true } : outcome;
   };
 
   while (!stopped()) {
     if (now() - lastSweep >= sweepIntervalS) {
       try {
-        await pool.query(SWEEP_SQL, [contract.workspace, terminalRetentionS]);
+        await pool.query(SWEEP_SQL, [contract.workspace, kindsParam, terminalRetentionS]);
       } catch (error) {
         warn({ error: String(error) }, "sol-jobs: failed to sweep expired terminal jobs");
       }
@@ -420,9 +459,9 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
       continue;
     }
 
-    const t0 = now();
     const outcome = await runHandler(row);
-    const durationS = now() - t0;
+    if ("lost" in outcome) continue;
+    const durationS = outcome.durationS;
     if (outcome.ok) {
       try {
         const result = (await pool.query(COMPLETE_SQL, [
@@ -430,14 +469,11 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
           row.attempts,
           contract.workspace,
         ])) as { rowCount: number | null };
-        if (result.rowCount === 0) leaseLost(row.id, row.attempts, "complete");
+        if (result.rowCount === 0) leaseLost(row, "complete");
+        else recordTerminal({ kind: row.kind, status: "ok", durationS });
       } catch (error) {
-        warn(
-          { job_id: String(row.id), error: String(error) },
-          "sol-jobs: failed to mark the job completed (will be reclaimed after its lease expires and re-run)",
-        );
+        databaseError(row, "complete", error);
       }
-      recordTerminal({ kind: row.kind, status: "ok", durationS });
       continue;
     }
 
@@ -450,14 +486,11 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
           row.attempts,
           contract.workspace,
         ])) as { rowCount: number | null };
-        if (result.rowCount === 0) leaseLost(row.id, row.attempts, "fail");
+        if (result.rowCount === 0) leaseLost(row, "fail");
+        else recordTerminal({ kind: row.kind, status: "failed", durationS });
       } catch (error) {
-        warn(
-          { job_id: String(row.id), error: String(error) },
-          "sol-jobs: failed to mark job permanently failed",
-        );
+        databaseError(row, "fail", error);
       }
-      recordTerminal({ kind: row.kind, status: "failed", durationS });
       continue;
     }
 
@@ -470,14 +503,11 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
         row.attempts,
         contract.workspace,
       ])) as { rowCount: number | null };
-      if (result.rowCount === 0) leaseLost(row.id, row.attempts, "retry");
+      if (result.rowCount === 0) leaseLost(row, "retry");
+      else options.onOutcome?.({ kind: row.kind, status: "retry", durationS });
     } catch (error) {
-      warn(
-        { job_id: String(row.id), error: String(error) },
-        "sol-jobs: failed to schedule job retry (will be reclaimed after its lease expires and re-run)",
-      );
+      databaseError(row, "retry", error);
     }
-    options.onOutcome?.({ kind: row.kind, status: "retry", durationS });
   }
 
   return undefined;
