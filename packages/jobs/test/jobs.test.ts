@@ -282,3 +282,145 @@ withDb("the lease-renewal sleep is aborted when the handler finishes", async () 
     assert.equal(renewalSignal.aborted, true, "the renewal sleep must be aborted once the handler finishes");
   });
 });
+
+test("enqueue rejects an invalid declared kind before issuing SQL", async () => {
+  let queries = 0;
+  const client: Queryable = { query: async () => { queries += 1; } };
+  for (const invalid of ["", "Bad Kind", "a,b"]) {
+    await assert.rejects(enqueue(client, { ...contract, kinds: ["send_email", invalid] }, { user: "a" }), /invalid/);
+  }
+  assert.equal(queries, 0);
+});
+
+withDb("short retention cannot release another kind's dedupe keys", async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" }, { dedupeKey: "retained" });
+    await pool.query("UPDATE sol_jobs SET status='completed', finished_at=now()-interval '1 day'");
+    const reports = { ...contract, kinds: ["report"], kind: () => "report" };
+    await enqueue(pool, reports, { user: "b" });
+    await pool.query("UPDATE sol_jobs SET status='completed', finished_at=now()-interval '1 day' WHERE kind='report'");
+    assert.equal(await runJobs({ pool, contract: reports, terminalRetentionS: 3600, maxJobs: 0 }), undefined);
+    await enqueue(pool, contract, { user: "a" }, { dedupeKey: "retained" });
+    assert.equal((await rows(pool)).length, 1);
+    assert.equal((await rows(pool))[0]?.status, "completed");
+  });
+});
+
+withDb("durable callbacks distinguish confirmed, fenced and rejected transitions", async () => {
+  for (const action of ["complete", "retry", "fail"] as const) {
+    for (const mode of ["confirmed", "stale", "database"] as const) {
+      await withFreshTable(async (pool) => {
+        await enqueue(pool, contract, { user: "a" });
+        if (mode === "database") {
+          await pool.query("CREATE OR REPLACE FUNCTION ts_reject_finalize() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'deliberate finalize rejection'; END $$");
+          await pool.query("CREATE TRIGGER reject_finalize BEFORE UPDATE ON sol_jobs FOR EACH ROW WHEN (NEW.locked_until IS NULL) EXECUTE FUNCTION ts_reject_finalize()");
+        }
+        const controller = new AbortController();
+        const durable: string[] = [];
+        const handlers: string[] = [];
+        const errors: string[] = [];
+        assert.equal(await runJobs({ pool, contract: { ...contract, handle: async () => {
+          if (mode === "stale") await pool.query("UPDATE sol_jobs SET attempts=attempts+1");
+          controller.abort();
+          if (action !== "complete") throw new Error("deliberate handler error");
+        } }, retryPolicy: { ...DEFAULT_RETRY_POLICY, maxAttempts: action === "fail" ? 1 : 2 },
+        signal: controller.signal, onOutcome: o => durable.push(o.status),
+        onHandlerOutcome: o => handlers.push(o.status),
+        onQueueError: e => errors.push(`${e.action}:${e.reason}`), onWarning: () => {} }), undefined);
+        assert.deepEqual(handlers, [action === "complete" ? "ok" : "error"]);
+        assert.deepEqual(durable, mode === "confirmed" ? [action === "complete" ? "ok" : action === "fail" ? "failed" : "retry"] : []);
+        assert.deepEqual(errors, mode === "confirmed" ? [] : [`${action}:${mode === "stale" ? "lease_lost" : "database_error"}`]);
+      });
+    }
+  }
+});
+
+withDb("confirmed loss aborts cooperative work and joins late-success cleanup", { timeout: 5000 }, async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    const stop = new AbortController();
+    let cleaned = false;
+    let aborted = false;
+    const durable: string[] = [];
+    const errors: string[] = [];
+    assert.equal(await runJobs({ pool, leaseS: 0.09, signal: stop.signal,
+      onOutcome: o => durable.push(o.status), onQueueError: e => errors.push(`${e.action}:${e.reason}`),
+      onWarning: () => {}, contract: { ...contract, handle: async (_job, { signal }) => {
+        await pool.query("UPDATE sol_jobs SET attempts=attempts+1, locked_until=now()+interval '1 hour'");
+        await new Promise<void>(resolve => {
+          const finish = () => { aborted = true; resolve(); };
+          if (signal.aborted) finish(); else signal.addEventListener("abort", finish, { once: true });
+        });
+        await new Promise(resolve => setTimeout(resolve, 50));
+        cleaned = true;
+        stop.abort();
+      } } }), undefined);
+    assert.equal(aborted, true);
+    assert.equal(cleaned, true);
+    assert.deepEqual(durable, []);
+    assert.deepEqual(errors, ["renew:lease_lost"]);
+    assert.equal((await rows(pool))[0]?.attempts, 2);
+    assert.equal((await rows(pool))[0]?.status, "pending");
+  });
+});
+
+withDb("late renewal retains an expired but unreclaimed attempt", { timeout: 5000 }, async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    const stop = new AbortController();
+    const errors: string[] = [];
+    assert.equal(await runJobs({ pool, leaseS: 0.09, signal: stop.signal, onWarning: () => {},
+      onQueueError: e => errors.push(e.reason), contract: { ...contract, handle: async () => {
+        await pool.query("UPDATE sol_jobs SET locked_until=now()-interval '1 second'");
+        await new Promise(resolve => setTimeout(resolve, 160));
+        stop.abort();
+      } } }), undefined);
+    assert.deepEqual(errors, []);
+    assert.equal((await rows(pool))[0]?.status, "completed");
+  });
+});
+
+withDb("renewal query errors preserve unknown ownership", { timeout: 5000 }, async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    await pool.query("CREATE OR REPLACE FUNCTION ts_reject_renew() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'deliberate renewal rejection'; END $$");
+    await pool.query("CREATE TRIGGER reject_renew BEFORE UPDATE ON sol_jobs FOR EACH ROW WHEN (NEW.attempts=OLD.attempts AND NEW.locked_until IS NOT NULL) EXECUTE FUNCTION ts_reject_renew()");
+    const stop = new AbortController();
+    const errors: string[] = [];
+    let aborted = false;
+    assert.equal(await runJobs({ pool, leaseS: 0.09, signal: stop.signal, onWarning: () => {},
+      onQueueError: e => errors.push(e.reason), contract: { ...contract, handle: async (_job, { signal }) => {
+        await new Promise(resolve => setTimeout(resolve, 160));
+        aborted = signal.aborted;
+        stop.abort();
+      } } }), undefined);
+    assert.equal(aborted, false);
+    assert.ok(errors.length > 0);
+    assert.ok(errors.every(e => e === "database_error"));
+    assert.equal((await rows(pool))[0]?.status, "completed");
+  });
+});
+
+withDb("joining renewal accepts sleep cancellation that rejects on abort", async () => {
+  const { setTimeout: delay } = await import("node:timers/promises");
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    assert.equal(await runJobs({ pool, contract, maxJobs: 1,
+      sleep: async (seconds, signal) => { await delay(seconds * 1000, undefined, { signal }); }
+    }), undefined);
+    assert.equal((await rows(pool))[0]?.status, "completed");
+  });
+});
+
+withDb("a durable outcome observer error is not reported as a database error", async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    const errors: string[] = [];
+    await assert.rejects(runJobs({ pool, contract, maxJobs: 1,
+      onOutcome: () => { throw new Error("observer failed"); },
+      onQueueError: e => errors.push(e.reason)
+    }), /observer failed/);
+    assert.deepEqual(errors, []);
+    assert.equal((await rows(pool))[0]?.status, "completed");
+  });
+});
