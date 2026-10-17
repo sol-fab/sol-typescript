@@ -424,3 +424,68 @@ withDb("a durable outcome observer error is not reported as a database error", a
     assert.equal((await rows(pool))[0]?.status, "completed");
   });
 });
+
+withDb("pre-start shutdown releases immediately without refunding generations", async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    const query = pool.query.bind(pool);
+    const controller = new AbortController();
+    let handled = 0;
+    // Deliver stop only after real PostgreSQL has returned the claimed row.
+    pool.query = (async (text: string, values?: unknown[]) => {
+      const result = await query(text, values);
+      if (text.startsWith("WITH candidate AS")) controller.abort();
+      return result;
+    }) as typeof pool.query;
+    const jobs = { ...contract, handle: async () => { handled += 1; } };
+    assert.equal(await runJobs({ pool, contract: jobs, signal: controller.signal, leaseS: 300 }), undefined);
+    pool.query = query;
+    assert.equal(handled, 0);
+    assert.equal((await rows(pool))[0]?.attempts, 1);
+    const result = await query("SELECT locked_until FROM sol_jobs");
+    assert.equal(result.rows[0]?.locked_until, null);
+    assert.equal(await runJobs({ pool, contract: jobs, maxJobs: 1 }), undefined);
+    assert.equal(handled, 1);
+    assert.equal((await rows(pool))[0]?.attempts, 2);
+    assert.equal((await rows(pool))[0]?.status, "completed");
+  });
+});
+
+withDb("pre-start release is fenced and repeated releases exhaust the budget", async () => {
+  for (const advance of [false, true]) {
+    await withFreshTable(async (pool) => {
+      await enqueue(pool, contract, { user: "a" });
+      const query = pool.query.bind(pool);
+      let handled = 0;
+      const jobs = { ...contract, handle: async () => { handled += 1; } };
+      for (let expected = 1; expected <= (advance ? 1 : 2); expected += 1) {
+        const controller = new AbortController();
+        const errors: string[] = [];
+        pool.query = (async (text: string, values?: unknown[]) => {
+          const result = await query(text, values);
+          if (text.startsWith("WITH candidate AS")) {
+            if (advance) await query("UPDATE sol_jobs SET attempts=attempts+1, locked_until=now()+interval '1 hour'");
+            controller.abort();
+          }
+          return result;
+        }) as typeof pool.query;
+        assert.equal(await runJobs({ pool, contract: jobs, signal: controller.signal,
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, maxAttempts: 2 },
+          onQueueError: e => errors.push(`${e.action}:${e.reason}`), onWarning: () => {} }), undefined);
+        pool.query = query;
+        assert.equal((await rows(pool))[0]?.attempts, advance ? 2 : expected);
+        assert.deepEqual(errors, advance ? ["retry:lease_lost"] : []);
+      }
+      if (advance) {
+        const result = await query("SELECT locked_until > now() AS protected FROM sol_jobs");
+        assert.equal(result.rows[0]?.protected, true);
+      } else {
+        assert.equal(await runJobs({ pool, contract: jobs, maxJobs: 1,
+          retryPolicy: { ...DEFAULT_RETRY_POLICY, maxAttempts: 2 } }), undefined);
+        assert.equal((await rows(pool))[0]?.status, "failed");
+        assert.equal((await rows(pool))[0]?.attempts, 2);
+      }
+      assert.equal(handled, 0);
+    });
+  }
+});
