@@ -489,3 +489,168 @@ withDb("pre-start release is fenced and repeated releases exhaust the budget", a
     });
   }
 });
+
+function gate(): { promise: Promise<void>; open: () => void } {
+  let open!: () => void;
+  return { promise: new Promise<void>(resolve => { open = resolve; }), open: () => open() };
+}
+
+async function untilAborted(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+}
+
+test("execution deadlines reject invalid values before database access", async () => {
+  let queries = 0;
+  const pool = { query: async () => { queries += 1; } } as unknown as pg.Pool;
+  for (const executionTimeoutS of [0, -1, NaN, Infinity]) {
+    const error = await runJobs({ pool, contract, executionTimeoutS });
+    assert.equal(error?.kind, "config");
+    assert.match(error?.message ?? "", /executionTimeoutS/);
+  }
+  assert.equal(queries, 0);
+});
+
+withDb("deadline cleanup keeps renewing beyond the original lease", { timeout: 5000 }, async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    const cleanup = gate();
+    const finish = gate();
+    let cleaned = false;
+    const running = runJobs({ pool, executionTimeoutS: 0.05, leaseS: 0.3, maxJobs: 1,
+      retryPolicy: { ...DEFAULT_RETRY_POLICY, maxAttempts: 1 }, onWarning: () => {},
+      contract: { ...contract, handle: async (_job, { signal }) => {
+        await untilAborted(signal);
+        cleanup.open();
+        await finish.promise;
+        cleaned = true;
+      } } });
+    await cleanup.promise;
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const result = await pool.query("SELECT attempts=1 AND status='pending' AND locked_until > now() AS renewed FROM sol_jobs");
+    assert.equal(result.rows[0]?.renewed, true);
+    assert.equal(cleaned, false);
+    finish.open();
+    assert.equal(await running, undefined);
+    assert.equal(cleaned, true);
+    assert.equal((await rows(pool))[0]?.status, "failed");
+    assert.equal((await rows(pool))[0]?.last_error, "cooperative execution deadline exceeded");
+  });
+});
+
+withDb("deadline retry waits for quiescence and preserves the attempt budget", { timeout: 5000 }, async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    let calls = 0;
+    let cleaned = false;
+    assert.equal(await runJobs({ pool, executionTimeoutS: 0.05, maxJobs: 1, onWarning: () => {},
+      retryPolicy: { ...DEFAULT_RETRY_POLICY, maxAttempts: 2, baseDelayS: 0, maxDelayS: 0 },
+      contract: { ...contract, handle: async (_job, { signal }) => {
+        calls += 1;
+        if (calls === 1) {
+          await untilAborted(signal);
+          await new Promise(resolve => setTimeout(resolve, 50));
+          cleaned = true;
+          signal.throwIfAborted();
+        }
+        assert.equal(cleaned, true);
+      } } }), undefined);
+    assert.equal(calls, 2);
+    assert.equal((await rows(pool))[0]?.status, "completed");
+    assert.equal((await rows(pool))[0]?.attempts, 2);
+  });
+});
+
+withDb("renewal uncertainty during deadline cleanup never bypasses attempt fences", { timeout: 10000 }, async () => {
+  for (const owner of ["original", "reclaimed", "confirmed_lost"]) {
+    await withFreshTable(async (pool) => {
+      await enqueue(pool, contract, { user: "a" });
+      await pool.query("CREATE TABLE IF NOT EXISTS ts_renewal_fault (enabled bool NOT NULL)");
+      await pool.query("TRUNCATE ts_renewal_fault");
+      await pool.query("INSERT INTO ts_renewal_fault VALUES (false)");
+      await pool.query("CREATE OR REPLACE FUNCTION ts_temporary_renewal_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF (SELECT enabled FROM ts_renewal_fault) THEN RAISE EXCEPTION 'deliberate temporary renewal failure'; END IF; RETURN NEW; END $$");
+      await pool.query("CREATE TRIGGER temporary_renewal_fault BEFORE UPDATE ON sol_jobs FOR EACH ROW WHEN (NEW.attempts=OLD.attempts AND NEW.locked_until IS NOT NULL) EXECUTE FUNCTION ts_temporary_renewal_fault()");
+      const cleanup = gate(), finish = gate(), errorSeen = gate(), lossSeen = gate();
+      const stop = new AbortController();
+      let calls = 0;
+      const outcomes: string[] = [], errors: string[] = [];
+      const running = runJobs({ pool, executionTimeoutS: 0.05, leaseS: 3, signal: stop.signal,
+        retryPolicy: { ...DEFAULT_RETRY_POLICY, maxAttempts: 2 }, onWarning: () => {},
+        onOutcome: o => outcomes.push(o.status), onQueueError: e => {
+          errors.push(`${e.action}:${e.reason}`);
+          if (e.action === "renew" && e.reason === "database_error") errorSeen.open();
+          if (e.action === "renew" && e.reason === "lease_lost") lossSeen.open();
+        }, contract: { ...contract, handle: async (_job, { signal }) => {
+          calls += 1;
+          await untilAborted(signal);
+          await pool.query("UPDATE ts_renewal_fault SET enabled=true");
+          cleanup.open();
+          await finish.promise;
+          stop.abort();
+        } } });
+      await cleanup.promise;
+      await errorSeen.promise;
+      assert.equal(calls, 1);
+      assert.equal((await rows(pool))[0]?.attempts, 1);
+      assert.equal((await rows(pool))[0]?.last_error, null);
+      await pool.query("UPDATE ts_renewal_fault SET enabled=false");
+      if (owner !== "original") await pool.query("UPDATE sol_jobs SET attempts=attempts+1, locked_until=now()+interval '1 hour'");
+      if (owner === "confirmed_lost") await lossSeen.promise;
+      finish.open();
+      assert.equal(await running, undefined);
+      if (owner === "original") {
+        assert.deepEqual(outcomes, ["retry"]);
+        assert.equal((await rows(pool))[0]?.last_error, "cooperative execution deadline exceeded");
+      } else {
+        assert.deepEqual(outcomes, []);
+        assert.equal((await rows(pool))[0]?.attempts, 2);
+        assert.equal((await rows(pool))[0]?.last_error, null);
+        assert.ok(errors.includes(`${owner === "confirmed_lost" ? "renew" : "retry"}:lease_lost`));
+        const result = await pool.query("SELECT locked_until > now() AS protected FROM sol_jobs");
+        assert.equal(result.rows[0]?.protected, true);
+      }
+    });
+  }
+});
+
+withDb("late completion includes blocking decode and handler before timer scheduling", async () => {
+  for (const blockDecode of [true, false]) {
+    await withFreshTable(async (pool) => {
+      await enqueue(pool, contract, { user: "a" });
+      const block = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      assert.equal(await runJobs({ pool, executionTimeoutS: 0.03, maxJobs: 1,
+        retryPolicy: { ...DEFAULT_RETRY_POLICY, maxAttempts: 1 }, onWarning: () => {},
+        contract: { ...contract,
+          decode: payload => { if (blockDecode) block(); return contract.decode(payload); },
+          handle: async () => { if (!blockDecode) block(); }
+        } }), undefined);
+      assert.equal((await rows(pool))[0]?.status, "failed");
+    });
+  }
+});
+
+withDb("completion time is captured before slow telemetry", async () => {
+  await withFreshTable(async (pool) => {
+    await enqueue(pool, contract, { user: "a" });
+    assert.equal(await runJobs({ pool, contract, executionTimeoutS: 0.2, maxJobs: 1,
+      onHandlerOutcome: () => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300); }
+    }), undefined);
+    assert.equal((await rows(pool))[0]?.status, "completed");
+  });
+});
+
+withDb("stop drains an active handler and large finite deadlines do not overflow timers", async () => {
+  for (const executionTimeoutS of [2, Number.MAX_VALUE]) {
+    await withFreshTable(async (pool) => {
+      await enqueue(pool, contract, { user: "a" });
+      const stop = new AbortController();
+      assert.equal(await runJobs({ pool, executionTimeoutS, signal: stop.signal,
+        contract: { ...contract, handle: async (_job, { signal }) => {
+          stop.abort();
+          await new Promise(resolve => setTimeout(resolve, 50));
+          assert.equal(signal.aborted, false);
+        } } }), undefined);
+      assert.equal((await rows(pool))[0]?.status, "completed");
+    });
+  }
+});
