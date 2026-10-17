@@ -62,7 +62,7 @@ export interface Queryable {
 }
 
 export interface JobContext {
-  /** Cooperative cancellation after confirmed claim loss. Join all attempt work before returning. */
+  /** Cooperative cancellation after confirmed claim loss or a configured execution deadline. Join all attempt work before returning. */
   readonly signal: AbortSignal;
 }
 
@@ -195,6 +195,8 @@ export interface RunJobsOptions<T> {
   readonly retryPolicy?: RetryPolicy;
   readonly pollIntervalS?: number;
   readonly leaseS?: number;
+  /** Optional cooperative execution deadline, not a hard execution limit. */
+  readonly executionTimeoutS?: number;
   /** Stop after this many terminal outcomes (tests). */
   readonly maxJobs?: number;
   readonly maxClaimFailures?: number;
@@ -301,6 +303,10 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
   const policy = options.retryPolicy ?? DEFAULT_RETRY_POLICY;
   const pollIntervalS = options.pollIntervalS ?? DEFAULT_POLL_INTERVAL_S;
   const leaseS = options.leaseS ?? DEFAULT_LEASE_S;
+  const executionTimeoutS = options.executionTimeoutS;
+  if (executionTimeoutS !== undefined && (!Number.isFinite(executionTimeoutS) || executionTimeoutS <= 0)) {
+    return { kind: "config", message: "executionTimeoutS must be a finite number > 0" };
+  }
   const maxClaimFailures = options.maxClaimFailures ?? DEFAULT_MAX_CLAIM_FAILURES;
   const terminalRetentionS = options.terminalRetentionS ?? DEFAULT_TERMINAL_RETENTION_S;
   const sweepIntervalS = options.sweepIntervalS ?? DEFAULT_SWEEP_INTERVAL_S;
@@ -383,6 +389,24 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
     let lost = false;
     const execution = new AbortController();
     const renewalStop = new AbortController();
+    const deadlineStop = new AbortController();
+    const started = performance.now();
+    const elapsed = (): number => (performance.now() - started) / 1000;
+    const timeoutMessage = "cooperative execution deadline exceeded";
+    let timedOut = false;
+    const deadline = (async () => {
+      if (executionTimeoutS === undefined) return;
+      while (!deadlineStop.signal.aborted) {
+        const remaining = executionTimeoutS - elapsed();
+        if (remaining <= 0) {
+          timedOut = true;
+          execution.abort(new Error(timeoutMessage));
+          return;
+        }
+        // Node timers overflow above this delay. Recheck monotonic time after each chunk.
+        await defaultSleep(Math.min(remaining, 2_147_483.647), deadlineStop.signal);
+      }
+    })();
     const renewal = (async () => {
       while (renewing) {
         try {
@@ -407,26 +431,35 @@ export async function runJobs<T>(options: RunJobsOptions<T>): Promise<RunError |
         }
       }
     })();
-    const started = performance.now();
     let outcome: { ok: true; durationS: number } | { ok: false; message: string; durationS: number };
     try {
       let result: { ok: true } | { ok: false; message: string };
+      let propagatedCancellation = false;
       try {
         await contract.handle(contract.decode(row.payload), { signal: execution.signal });
         result = { ok: true };
       } catch (error) {
+        propagatedCancellation = execution.signal.aborted && error === execution.signal.reason;
         result = { ok: false, message: error instanceof Error ? error.message : String(error) };
       }
-      const durationS = (performance.now() - started) / 1000;
-      if (!execution.signal.aborted) options.onHandlerOutcome?.({ kind: row.kind, status: result.ok ? "ok" : "error", durationS });
+      const durationS = elapsed();
+      if (executionTimeoutS !== undefined && durationS >= executionTimeoutS) timedOut = true;
+      if (!propagatedCancellation) options.onHandlerOutcome?.({ kind: row.kind, status: result.ok ? "ok" : "error", durationS });
       outcome = { ...result, durationS };
     } finally {
       renewing = false;
       renewalStop.abort();
-      // Join any in-flight renewal before deciding whether finalization is allowed.
-      await renewal;
+      deadlineStop.abort();
+      // Cleanup must settle before renewal stops and before a retry or new local claim.
+      await Promise.all([renewal, deadline]);
     }
-    return lost ? { lost: true } : outcome;
+    if (lost) return { lost: true };
+    if (timedOut) {
+      warn({ job_id: String(row.id), kind: row.kind, attempt: String(row.attempts) },
+        "sol-jobs: cooperative execution deadline exceeded; handler cleanup has exited");
+      return { ok: false, message: timeoutMessage, durationS: outcome.durationS };
+    }
+    return outcome;
   };
 
   while (!stopped()) {

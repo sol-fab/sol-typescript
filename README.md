@@ -111,3 +111,16 @@ npm install
 npm run build --workspaces
 npm run test --workspaces
 ```
+
+`runJobs({ executionTimeoutS })` accepts an optional finite, positive cooperative
+execution deadline. Monotonic timing starts before decode, and completion time is
+captured before telemetry. Deadline expiry aborts the attempt signal and waits for
+the handler promise and cleanup to settle; renewal continues during cleanup.
+Only afterward does the original attempt fence permit a timeout retry/failure.
+Late success cannot erase timeout, including blocking work that returns before
+the timer can run. Confirmed claim loss wins over timeout and suppresses stale
+finalization. Renewal errors remain unknown ownership and do not release work.
+Blocking JavaScript or ignored aborts can occupy the loop indefinitely; there is
+no hard execution limit. The worker `signal` remains a drain request, distinct
+from the handler's cancellation signal. JavaScript promises provide no Eio-style
+implicit parent cancellation; abandoning `runJobs` does not cancel its work.
