@@ -1,6 +1,6 @@
 {
   "name": "@sol-fab/outbox",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sol's Postgres transactional outbox for TypeScript -- commit a domain change and its publication intent in one transaction, then publish per key in order, mirroring sol-outbox. A library, not a primitive: host its relay from an ordinary @sol-fab/worker binary.",
   "license": "Apache-2.0",
   "type": "module",

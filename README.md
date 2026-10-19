@@ -12,7 +12,11 @@ Source repository for Sol's TypeScript application-runtime packages:
 - **`packages/outbox`** → `@sol-fab/outbox` — Sol's Postgres transactional
   outbox: a `publish` that joins the caller's transaction and a `runRelay` that
   publishes each key's events in order, deleting a row only after the broker
-  acknowledged it. Mirrors `framework/sol-outbox`.
+  acknowledged it. Each relay declares its `kinds` from the same `OutboxContract`
+  used to enqueue events. Relays sharing a table must own disjoint kinds; an
+  earlier foreign event still blocks later events of the same key. One logical
+  relay per kind remains required (there is no replica fencing).
+  Mirrors `framework/sol-outbox`.
 - **`packages/retry`** → `@sol-fab/retry` — Sol's operation-level retry helper:
   one bounded, jittered policy vocabulary (`baseDelayS`, `maxDelayS`,
   `maxAttempts`, `jitterRatio`) that retries a dependency call in place, never a
