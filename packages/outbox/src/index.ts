@@ -172,6 +172,10 @@ export type PublicationStatus = "ok" | "failed" | "mark_failed";
 
 export interface RelayOptions {
   readonly pool: Pool;
+  /** This owner's kinds, normally the same contract.kinds used by publish.
+   * Owners sharing a table must have disjoint kinds. A foreign head still
+   * blocks later events of its key; ownership never relaxes per-key order. */
+  readonly kinds: readonly string[];
   /**
    * Publish one event and resolve only once the broker acknowledged it. A
    * failure must reject; the relay leaves the row unpublished and does not
@@ -195,7 +199,8 @@ export interface RelayOptions {
 
 const oldestPerKeySql = `SELECT o.id, o.ord, o.aggregate_key, o.kind, o.payload
   FROM ${OUTBOX_TABLE} o
-  WHERE o.ord = (SELECT min(i.ord) FROM ${OUTBOX_TABLE} i WHERE i.aggregate_key = o.aggregate_key)
+  WHERE o.kind = ANY($2::text[])
+    AND o.ord = (SELECT min(i.ord) FROM ${OUTBOX_TABLE} i WHERE i.aggregate_key = o.aggregate_key)
   ORDER BY o.id
   LIMIT $1`;
 
@@ -211,7 +216,7 @@ const defaultSleep = (seconds: number): Promise<void> =>
  * it only after the publish resolves, and repeat. Returns `undefined` on a
  * clean stop, or the `RunError` that stopped it.
  *
- * v1 is one logical relay owner. Overlapping owners are a correctness problem,
+ * Each kind has one logical relay owner. Overlapping owners are a correctness problem,
  * not a performance one: two owners publishing a key can invert it, and a plain
  * producer carries no fencing token. Scaling is a trigger, not a design.
  */
@@ -226,6 +231,9 @@ export async function runRelay(options: RelayOptions): Promise<RunError | undefi
       console.warn(message, fields);
     });
   const stopped = (): boolean => options.signal?.aborted ?? false;
+
+  const kindsError = validateKinds(options.kinds);
+  if (kindsError) return kindsError;
 
   const timingError = validateTiming(pollIntervalS, batch);
   if (timingError) return timingError;
@@ -279,7 +287,7 @@ export async function runRelay(options: RelayOptions): Promise<RunError | undefi
   const drain = async (): Promise<RunError | undefined> => {
     let rows: Row[];
     try {
-      const result = (await pool.query(oldestPerKeySql, [batch])) as { rows: Row[] };
+      const result = (await pool.query(oldestPerKeySql, [batch, options.kinds])) as { rows: Row[] };
       rows = result.rows;
     } catch (error) {
       return { kind: "database", message: String(error) };

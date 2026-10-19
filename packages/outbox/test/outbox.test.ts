@@ -86,6 +86,7 @@ async function relayUntil(
 ): Promise<Awaited<ReturnType<typeof runRelay>>> {
   const controller = new AbortController();
   return runRelay({
+    kinds: ORDERS.kinds,
     pool,
     publish: async (publication) => {
       await publish(publication);
@@ -183,6 +184,7 @@ withDb("relay: a failed publish leaves the row and holds later events for that k
     const controller = new AbortController();
     let failFirst = true;
     const failure = await runRelay({
+      kinds: ORDERS.kinds,
       pool,
       publish: async (publication) => {
         attempts.push(publication.ord);
@@ -216,6 +218,7 @@ withDb("relay: a crash between acknowledgement and deletion duplicates rather th
 
     const first: Publication[] = [];
     const failure = await runRelay({
+      kinds: ORDERS.kinds,
       pool: poisoned,
       publish: async (publication) => {
         first.push(publication);
@@ -231,6 +234,7 @@ withDb("relay: a crash between acknowledgement and deletion duplicates rather th
     const second: Publication[] = [];
     const controller = new AbortController();
     await runRelay({
+      kinds: ORDERS.kinds,
       pool,
       publish: async (publication) => {
         second.push(publication);
@@ -249,6 +253,7 @@ withDb("relay: a missing table is a database error naming the migration", async 
   await withFreshTable(async (pool) => {
     await pool.query(`DROP TABLE ${OUTBOX_TABLE}`);
     const failure = await runRelay({
+      kinds: ORDERS.kinds,
       pool,
       publish: async () => {},
       sleep: async () => {},
@@ -267,6 +272,7 @@ withDb("relay: reports pending count and oldest age per kind", async () => {
     const snapshots: Array<{ pendingByKind: Array<{ kind: string; value: number }>; oldestPendingSecondsByKind: Array<{ kind: string; value: number }> }> = [];
     const controller = new AbortController();
     const failure = await runRelay({
+      kinds: ORDERS.kinds,
       pool,
       publish: async () => {
         throw new Error("hold every row so the gauges see the backlog");
@@ -287,4 +293,69 @@ withDb("relay: reports pending count and oldest age per kind", async () => {
     assert.equal(snapshots[0]?.oldestPendingSecondsByKind[0]?.kind, "order-placed");
     assert.ok((snapshots[0]?.oldestPendingSecondsByKind[0]?.value ?? -1) >= 0);
   });
+});
+
+
+withDb("relay ownership: foreign heads cannot consume the batch or be skipped within a key", async () => {
+  await withFreshTable(async (pool) => {
+    const events: OutboxContract<Publication> = {
+      kinds: ["placed", "fulfilled"],
+      kind: (p) => p.kind,
+      encode: (p) => p.payload,
+    };
+    for (const p of [
+      { kind: "placed", key: "shared", ord: 1, payload: "first" },
+      { kind: "fulfilled", key: "shared", ord: 2, payload: "second" },
+      { kind: "fulfilled", key: "independent", ord: 1, payload: "other" },
+    ]) await publish(pool, events, p, p);
+
+    const seen: Publication[] = [];
+    const warnings: string[] = [];
+    const pass = async (kinds: readonly string[], fail = false) => {
+      const controller = new AbortController();
+      return runRelay({
+        pool, kinds, batch: 1,
+        publish: async (p) => {
+          assert.ok(kinds.includes(p.kind), "never dispatch another owner's row");
+          if (fail) throw new Error("broker unavailable");
+          // Deletion must still wait for broker acknowledgement.
+          assert.ok((await pending(pool)).some((row) => row.key === p.key && row.ord === p.ord));
+          seen.push(p);
+        },
+        onWarning: (_, message) => warnings.push(message),
+        signal: controller.signal,
+        sleep: async () => controller.abort(),
+      });
+    };
+
+    assert.equal(await pass(["fulfilled"]), undefined);
+    assert.deepEqual(seen.map((p) => p.key), ["independent"], "a foreign head cannot exhaust batch=1 or allow ord 2 past ord 1");
+    assert.deepEqual(warnings, [], "foreign rows are not failed publications");
+    assert.equal(await pass(["placed"], true), undefined);
+    assert.equal(warnings.length, 1, "a genuine owned publication failure is still reported");
+    assert.deepEqual(await pending(pool), [{ key: "shared", ord: 1 }, { key: "shared", ord: 2 }]);
+    assert.equal(await pass(["fulfilled"]), undefined);
+    assert.equal(seen.length, 1, "failed foreign head still blocks the later owned event");
+
+    // Restart both owners against the same table; their rows remain ordered.
+    assert.equal(await pass(["placed"]), undefined);
+    assert.equal(await pass(["fulfilled"]), undefined);
+    assert.deepEqual(seen.map((p) => [p.key, p.ord]), [["independent", 1], ["shared", 1], ["shared", 2]]);
+    assert.equal(await pendingCount(pool), 0);
+    assert.equal(warnings.length, 1, "neither restart reported a foreign publication failure");
+  });
+});
+
+
+test("relay ownership: invalid kinds fail before database access", async () => {
+  for (const kinds of [[], ["Invalid Kind"]]) {
+    let queried = false;
+    const failure = await runRelay({
+      pool: { query: async () => { queried = true; throw new Error("must not query"); } } as unknown as pg.Pool,
+      kinds,
+      publish: async () => { throw new Error("must not publish"); },
+    });
+    assert.equal(failure?.kind, "config");
+    assert.equal(queried, false);
+  }
 });
