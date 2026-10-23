@@ -40,6 +40,12 @@ route returns 503 while the listener still serves. The listener keeps serving
 for `shutdownDelayMs` (default 5s, `sol-svc`'s `shutdown_delay_s`) before the
 drain starts, so a readiness probe observes the flip before the socket closes.
 
+`@sol-fab/worker` exports `createWorkerHealth`: readiness means the consumer has
+joined its group, liveness means a poll/heartbeat was seen within 30 seconds, and
+the helper returns the same `/readyz`/`/livez` status codes and bodies as
+`sol-worker`'s health server. A rebalance keeps readiness; the app wires
+`GROUP_JOIN` and `HEARTBEAT` and serves the responses on its metrics port.
+
 `@sol-fab/svc` exports `declaredPeer`, `peerUrl`, and `peerHeaders` for generated
 application bindings. `peerHeaders` reads the projected token file for each call
 so token rotation is observed; it uses the local API-key fallback only when

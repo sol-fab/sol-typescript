@@ -89,3 +89,10 @@ export function runWorker(opts: RunWorkerOptions): WorkerLifecycle {
     },
   };
 }
+
+export { createWorkerHealth } from "./health.js";
+export type {
+  WorkerHealth,
+  WorkerHealthOptions,
+  WorkerHealthResponse,
+} from "./health.js";
