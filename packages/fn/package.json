@@ -1,0 +1,48 @@
+{
+  "name": "@sol-fab/fn",
+  "version": "0.1.0",
+  "description": "Sol's run-once function contract for TypeScript CronJob units -- execute the handler once, exit 0/1/130, push the invocation counter and duration histogram to the Prometheus Pushgateway, and expose an AbortSignal for SIGTERM/SIGINT. Not a Lambda runtime and not a Kafka consumer.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sol-fab/sol-typescript.git",
+    "directory": "packages/fn"
+  },
+  "keywords": [
+    "sol",
+    "cronjob",
+    "function",
+    "pushgateway"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --import tsx --test test/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "prom-client": "^15.1.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

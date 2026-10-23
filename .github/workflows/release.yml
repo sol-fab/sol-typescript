@@ -15,8 +15,10 @@ name: Release
 #   npm trust github @sol-fab/jobs   --file release.yml --allow-publish
 #   npm trust github @sol-fab/outbox --file release.yml --allow-publish
 #   npm trust github @sol-fab/retry  --file release.yml --allow-publish
+#   npm trust github @sol-fab/fn     --file release.yml --allow-publish
 #
-# `@sol-fab/svc`, `@sol-fab/worker` and `@sol-fab/jobs` are configured. npm
+# `@sol-fab/svc`, `@sol-fab/worker` and `@sol-fab/jobs` are configured; `@sol-fab/fn`
+# must be bootstrapped and trusted at its first release. npm
 # rejects `npm trust` for a package that does not exist yet (`404 Package not
 # found`), so a brand new package is bootstrapped with one authenticated
 # `npm publish` and its trust is configured immediately afterwards; every
@@ -32,13 +34,14 @@ on:
       - "jobs-v*"
       - "outbox-v*"
       - "retry-v*"
+      - "fn-v*"
   workflow_dispatch:
     inputs:
       package:
-        description: "Package to publish (svc, worker, jobs, outbox or retry)"
+        description: "Package to publish (svc, worker, jobs, outbox, retry or fn)"
         required: true
         type: choice
-        options: [svc, worker, jobs, outbox, retry]
+        options: [svc, worker, jobs, outbox, retry, fn]
 
 permissions:
   contents: read
