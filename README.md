@@ -22,6 +22,11 @@ Source repository for Sol's TypeScript application-runtime packages:
   `maxAttempts`, `jitterRatio`) that retries a dependency call in place, never a
   message or a handler. Mirrors `framework/sol-retry`; `@sol-fab/jobs` consumes
   the same vocabulary rather than keeping its own copy.
+- **`packages/fn`** → `@sol-fab/fn` — Sol's run-once function contract for
+  TypeScript CronJob units: execute the handler once, exit 0/1/130, expose an
+  AbortSignal for SIGTERM/SIGINT, and push the invocation counter and duration
+  histogram to the Prometheus Pushgateway. Mirrors `framework/sol-fn`'s Cron
+  path. It is not a Lambda runtime and not a Kafka consumer.
 
 The packages keep lifecycle and helper ownership narrow: routing and inbound
 HTTP stay Fastify/Express, Kafka consumption stays `kafkajs`, DLQ routing stays
@@ -99,17 +104,21 @@ release a no-op. One active job is enforced
 per `runJobs` loop, not per worker process. Use separate ordinary worker
 Deployments for materially different resource/reliability classes.
 
-No `@sol-fab/fn` package exists yet -- `sol-fn`'s OCaml contract (run once,
-return, `SIGTERM` before the next invocation) has no measured TypeScript gap
-to justify one; see the `sol` repo's `FEAT-036` ticket.
+`@sol-fab/fn` implements the run-once contract on the CronJob path: one handler
+invocation, exit 0/1/130, `PUSHGATEWAY_URL`/`SOL_PUSHGATEWAY_JOB` handling, and
+the `sol_fn_invocations_total`/`sol_fn_duration_seconds` metrics. The handler
+receives an `AbortSignal` that aborts on SIGTERM/SIGINT; an uncancelled handler
+still exits 130. Lambda is deliberately not part of this package.
 
 ## Status
 
 Published to npm as `@sol-fab/svc`, `@sol-fab/worker`, `@sol-fab/jobs`,
 `@sol-fab/outbox` and `@sol-fab/retry`; a tag (`svc-v*`, `worker-v*`,
-`jobs-v*`, `outbox-v*`, `retry-v*`) publishes through the OIDC release
-workflow. Publish `retry` before a `jobs` release that depends on it. See the
-`sol` repo's `pipeline/tickets/` for sequencing.
+`jobs-v*`, `outbox-v*`, `retry-v*`, `fn-v*`) publishes through the OIDC release
+workflow. `@sol-fab/fn` is new: its first publish bootstraps the package and
+its npm trust relationship, after which releases are OIDC-only. Publish `retry`
+before a `jobs` release that depends on it. See the `sol` repo's issues for
+sequencing.
 
 The `@sol-fab/jobs` and `@sol-fab/outbox` behaviour tests need a Postgres: CI
 runs one and sets `POSTGRES_URL`, and without it those cases self-skip.
